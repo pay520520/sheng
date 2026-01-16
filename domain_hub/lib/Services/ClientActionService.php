@@ -1837,97 +1837,126 @@ if($_POST['action'] == "delete_dns_record" && isset($_POST['record_id']) && isse
     $record_id = trim($_POST['record_id']);
 
     try {
-        $sub = Capsule::table('mod_cloudflare_subdomain')
-            ->where('id', $subdomain_id)
-            ->where('userid', $userid)
-            ->first();
+        $result = Capsule::transaction(function () use ($subdomain_id, $record_id, $userid, $module_settings) {
+            $sub = Capsule::table('mod_cloudflare_subdomain')
+                ->where('id', $subdomain_id)
+                ->where('userid', $userid)
+                ->lockForUpdate()
+                ->first();
 
-        if ($sub) {
+            if (!$sub) {
+                throw new \RuntimeException('subdomain_not_found');
+            }
+
             $rec = Capsule::table('mod_cloudflare_dns_records')
                 ->where('subdomain_id', $subdomain_id)
                 ->where('record_id', $record_id)
+                ->lockForUpdate()
                 ->first();
 
-            if ($rec) {
-                list($cf, $providerError, $providerContext) = cfmod_client_acquire_provider_for_subdomain($sub, $module_settings);
-                if (!$cf) {
-                    $msg = $providerError;
-                    $msg_type = 'danger';
-                } else {
-                    $delRes = $cf->deleteSubdomain($sub->cloudflare_zone_id, $record_id, [
-                        'name' => $rec->name,
-                        'type' => $rec->type,
-                        'content' => $rec->content,
-                    ]);
-                    if ($delRes['success']) {
-                        try {
-                            $fresh = $cf->getDnsRecords($sub->cloudflare_zone_id, $sub->subdomain);
-                            if (($fresh['success'] ?? false)) {
-                                foreach (($fresh['result'] ?? []) as $fr) {
-                                    $exists = self::findLocalRecordByRemote($subdomain_id, $fr);
-                                    if (!$exists) {
-                                        Capsule::table('mod_cloudflare_dns_records')->insert([
-                                            'subdomain_id' => $subdomain_id,
-                                            'zone_id' => $sub->cloudflare_zone_id,
-                                            'record_id' => isset($fr['id']) ? (string) $fr['id'] : null,
-                                            'name' => ($fr['name'] ?? $sub->subdomain),
-                                            'type' => strtoupper($fr['type'] ?? 'A'),
-                                            'content' => ($fr['content'] ?? ''),
-                                            'ttl' => intval($fr['ttl'] ?? 600),
-                                            'proxied' => 0,
-                                            'status' => 'active',
-                                            'created_at' => date('Y-m-d H:i:s'),
-                                            'updated_at' => date('Y-m-d H:i:s')
-                                        ]);
-                                    }
-                                }
-                            }
-                        } catch (Exception $e) {}
+            if (!$rec) {
+                throw new \RuntimeException('record_not_found');
+            }
 
-                        CfSubdomainService::syncDnsHistoryFlag($subdomain_id);
+            list($cf, $providerError, $providerContext) = cfmod_client_acquire_provider_for_subdomain($sub, $module_settings);
+            if (!$cf) {
+                throw new \RuntimeException($providerError ?: 'provider_unavailable');
+            }
 
-                        Capsule::table('mod_cloudflare_dns_records')
-                            ->where('id', $rec->id)
-                            ->delete();
+            $delRes = $cf->deleteSubdomain($sub->cloudflare_zone_id, $record_id, [
+                'name' => $rec->name,
+                'type' => $rec->type,
+                'content' => $rec->content,
+            ]);
 
-                        if ($rec->name === $sub->subdomain && $sub->dns_record_id === $record_id) {
-                            Capsule::table('mod_cloudflare_subdomain')
-                                ->where('id', $subdomain_id)
-                                ->update([
-                                    'dns_record_id' => null,
-                                    'updated_at' => date('Y-m-d H:i:s')
-                                ]);
-                        }
+            if (!($delRes['success'] ?? false)) {
+                $errorCode = $delRes['code'] ?? null;
+                $errorMessage = $delRes['errors'] ?? $delRes['message'] ?? '';
+                if (is_array($errorMessage)) {
+                    $errorMessage = json_encode($errorMessage, JSON_UNESCAPED_UNICODE);
+                }
+                $errorMessage = (string) $errorMessage;
 
-                        $remainingRecords = Capsule::table('mod_cloudflare_dns_records')
-                            ->where('subdomain_id', $subdomain_id)
-                            ->count();
-                        if ($remainingRecords == 0) {
-                            Capsule::table('mod_cloudflare_subdomain')
-                                ->where('id', $subdomain_id)
-                                ->update([
-                                    'notes' => '已注册，等待解析设置',
-                                    'updated_at' => date('Y-m-d H:i:s')
-                                ]);
-                        }
+                $isNotFound = $errorCode === 404 
+                    || $errorCode === '404'
+                    || stripos($errorMessage, 'not found') !== false 
+                    || stripos($errorMessage, '不存在') !== false
+                    || stripos($errorMessage, 'does not exist') !== false
+                    || stripos($errorMessage, 'record not found') !== false;
 
-                        if (function_exists('cloudflare_subdomain_log')) {
-                            cloudflare_subdomain_log('client_delete_dns_record', ['record_id' => $record_id, 'name' => $rec->name], $userid, $subdomain_id);
-                        }
-
-                        $msg = self::actionText('dns.delete.success', '已删除DNS记录');
-                        $msg_type = "success";
-                    } else {
-                        $msg = self::actionText('dns.delete.failed', '删除DNS记录失败');
-                        $msg_type = "danger";
-                    }
+                if (!$isNotFound) {
+                    throw new \RuntimeException('dns_delete_failed: ' . $errorMessage);
                 }
             }
+
+            Capsule::table('mod_cloudflare_dns_records')
+                ->where('id', $rec->id)
+                ->delete();
+
+            if ($rec->name === $sub->subdomain && $sub->dns_record_id === $record_id) {
+                Capsule::table('mod_cloudflare_subdomain')
+                    ->where('id', $subdomain_id)
+                    ->update([
+                        'dns_record_id' => null,
+                        'updated_at' => date('Y-m-d H:i:s')
+                    ]);
+            }
+
+            $remainingRecords = Capsule::table('mod_cloudflare_dns_records')
+                ->where('subdomain_id', $subdomain_id)
+                ->count();
+
+            if ($remainingRecords == 0) {
+                Capsule::table('mod_cloudflare_subdomain')
+                    ->where('id', $subdomain_id)
+                    ->update([
+                        'notes' => '已注册，等待解析设置',
+                        'updated_at' => date('Y-m-d H:i:s')
+                    ]);
+            }
+
+            CfSubdomainService::syncDnsHistoryFlag($subdomain_id);
+
+            return [
+                'subdomain_id' => $subdomain_id,
+                'record_id' => $record_id,
+                'record_name' => $rec->name ?? '',
+                'record_type' => $rec->type ?? '',
+            ];
+        });
+
+        if (function_exists('cloudflare_subdomain_log')) {
+            cloudflare_subdomain_log('client_delete_dns_record', [
+                'record_id' => $result['record_id'],
+                'name' => $result['record_name'],
+                'type' => $result['record_type']
+            ], $userid, $result['subdomain_id']);
         }
-    } catch (Exception $e) {
-        $errorText = cfmod_format_provider_error($e->getMessage());
-        $msg = self::actionText('dns.delete.failed_detail', '删除DNS记录失败：%s', [$errorText]);
-        $msg_type = "danger";
+
+        $msg = self::actionText('dns.delete.success', '已删除DNS记录');
+        $msg_type = "success";
+
+    } catch (\Throwable $e) {
+        $errorMessage = $e->getMessage();
+
+        if (strpos($errorMessage, 'subdomain_not_found') !== false) {
+            $msg = self::actionText('dns.delete.subdomain_not_found', '域名不存在或已被删除，请刷新页面');
+            $msg_type = 'warning';
+        } elseif (strpos($errorMessage, 'record_not_found') !== false) {
+            $msg = self::actionText('dns.delete.record_not_found', 'DNS记录不存在或已被删除，请刷新页面');
+            $msg_type = 'warning';
+        } elseif (strpos($errorMessage, 'provider_unavailable') !== false) {
+            $msg = self::actionText('dns.delete.provider_error', 'DNS供应商暂时不可用，请稍后再试');
+            $msg_type = 'danger';
+        } elseif (strpos($errorMessage, 'dns_delete_failed:') !== false) {
+            $errorDetail = cfmod_format_provider_error(str_replace('dns_delete_failed: ', '', $errorMessage));
+            $msg = self::actionText('dns.delete.failed_detail', '删除DNS记录失败：%s', [$errorDetail]);
+            $msg_type = 'danger';
+        } else {
+            $errorDetail = cfmod_format_provider_error($errorMessage);
+            $msg = self::actionText('dns.delete.failed_detail', '删除DNS记录失败：%s', [$errorDetail]);
+            $msg_type = 'danger';
+        }
     }
 }
 

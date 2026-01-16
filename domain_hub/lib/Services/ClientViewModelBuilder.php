@@ -467,6 +467,24 @@ class CfClientViewModelBuilder
                 ]);
                 $quota = Capsule::table('mod_cloudflare_subdomain_quotas')->where('userid', $userId)->first();
             }
+
+            if ($quota && $userId > 0) {
+                $isPrivileged = function_exists('cf_is_user_privileged') && cf_is_user_privileged($userId);
+
+                if (!$isPrivileged) {
+                    if (function_exists('cf_sync_user_base_quota_if_needed') && $max > 0) {
+                        $quota = cf_sync_user_base_quota_if_needed($userId, $max, $quota);
+                    }
+                    if (function_exists('cf_sync_user_invite_limit_if_needed') && $inviteLimitGlobal > 0) {
+                        $quota = cf_sync_user_invite_limit_if_needed($userId, $inviteLimitGlobal, $quota);
+                    }
+                } else {
+                    if (function_exists('cf_ensure_privileged_quota')) {
+                        $quota = cf_ensure_privileged_quota($userId, $quota, $inviteLimitGlobal);
+                    }
+                }
+            }
+
             return $quota;
         } catch (\Throwable $e) {
             return (object) [
